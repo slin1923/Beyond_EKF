@@ -51,6 +51,8 @@ gnss_lib_py
 
 pip install -r requirements.txt
 
+open the main.py file and review/replace the "TO DO".  
+
 Then simply run:
 
 python main.py

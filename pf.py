@@ -6,7 +6,7 @@ from gnss_lib_py.algorithms.snapshot import solve_wls
 from gnss_lib_py.utils.coordinates import ecef_to_geodetic
 from gnss_lib_py.utils.filters import BaseFilter
 
-NP = 5000
+R_FIX = 1 # measurement noise variance
 
 class GNSSPF(BaseFilter):
     """GNSS-only Particle Filter (3D pos, 3D vel, clock bias) - Vectorized"""
@@ -14,14 +14,14 @@ class GNSSPF(BaseFilter):
         super().__init__(init_dict['state_0'], init_dict['sigma_0'])
         self.Q = init_dict['Q']
         self.R = init_dict['R']
-        self.delta_t = params_dict.get("dt", 1.0)
+        self.delta_t = params_dict.get("dt", 1)
         self.motion_type = params_dict.get("motion_type","stationary")
         self.measure_type = params_dict.get("measure_type","pseudorange")
-        self.Np = params_dict.get("Np", NP)
+        self.Np = params_dict.get("Np", 10)
 
         # Vectorized: Initialize all particles at once
         self.particles = np.repeat(self.state, self.Np, axis=1)
-        self.particles += np.random.multivariate_normal(np.zeros(7), self.sigma, self.Np).T
+        self.particles += np.random.multivariate_normal(np.zeros(7), self.sigma, self.Np).T # add initial noise
         self.weights = np.ones((self.Np,1)) / self.Np
 
     def predict(self, predict_dict=None):
@@ -69,7 +69,7 @@ class GNSSPF(BaseFilter):
         
         # Compute quadratic form: sum over measurements
         # For each particle: residual[i] @ R_inv @ residual[i].T
-        log_likelihoods = -0.5 * np.sum(residuals @ R_inv * residuals, axis=1)  # (Np,)
+        log_likelihoods = -0.5 * np.sum((residuals @ R_inv) * residuals, axis=1)  # (Np,)
         
         # Numerical stability
         log_likelihoods -= np.max(log_likelihoods)
@@ -77,8 +77,8 @@ class GNSSPF(BaseFilter):
         
         # Update weights
         self.weights = (self.weights.flatten() * likelihoods).reshape(-1,1)
-        self.weights += 1e-300
-        self.weights /= np.sum(self.weights)
+        self.weights += 1e-300 # avoid zeros
+        self.weights /= np.sum(self.weights) # normalize
 
         # Resample if needed
         Neff = 1.0 / np.sum(self.weights**2)
@@ -137,15 +137,15 @@ def solve_gnss_pf(measurements, init_dict=None, params_dict=None, delta_t_decima
         init_dict["state_0"] = state_0
 
     # TUNE THESE: Start with smaller process noise for PF!
-    init_dict.setdefault("sigma_0", np.diag([10, 10, 10, 1, 1, 1, 10])**2 * 1e-3)  # Initial uncertainty
-    init_dict.setdefault("Q", np.diag([0.1, 0.1, 0.1, 0.01, 0.01, 0.01, 0.1])**2)  # TUNE: process noise (small!)
-    init_dict.setdefault("R", np.eye(1)*25)  # TUNE: measurement noise (~5m pseudorange error)
+    init_dict.setdefault("sigma_0", np.eye(init_dict["state_0"].size) * 10)  # Initial uncertainty
+    init_dict.setdefault("Q", np.eye(init_dict["state_0"].size))  # TUNE: process noise (small!)
+    init_dict.setdefault("R", np.eye(1) * R_FIX)  # TUNE: measurement noise
 
     if params_dict is None:
         params_dict = {}
     params_dict.setdefault("motion_type", "constant_velocity")
     params_dict.setdefault("measure_type", "pseudorange")
-    params_dict.setdefault("Np", NP)  # TUNE: number of particles (try 100-500 for better performance)
+    params_dict.setdefault("Np", 10)  # TUNE: number of particles (try 100-500 for better performance)
 
     gnss_pf = GNSSPF(init_dict, params_dict)
     states = []
@@ -153,13 +153,14 @@ def solve_gnss_pf(measurements, init_dict=None, params_dict=None, delta_t_decima
     for timestamp, delta_t, measurement_subset in loop_time(measurements,"gps_millis"):
         pos_sv_m = np.atleast_2d(measurement_subset[["x_sv_m","y_sv_m","z_sv_m"]].T)
         corr_pr_m = measurement_subset["corr_pr_m"].reshape(-1,1)
+
         not_nan_idx = ~np.isnan(pos_sv_m).any(axis=1) & ~np.isnan(corr_pr_m).any(axis=1)
         pos_sv_m = pos_sv_m[not_nan_idx]
         corr_pr_m = corr_pr_m[not_nan_idx]
 
         gnss_pf.predict(predict_dict={"delta_t": delta_t})
         gnss_pf.update(corr_pr_m, update_dict={"pos_sv_m": pos_sv_m.T,
-                                               "measurement_noise": np.eye(pos_sv_m.shape[0]) * 25})
+                                               "measurement_noise": np.eye(pos_sv_m.shape[0]) * R_FIX})
 
         states.append([timestamp] + np.squeeze(gnss_pf.state).tolist())
 
